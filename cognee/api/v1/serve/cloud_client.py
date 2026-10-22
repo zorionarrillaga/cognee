@@ -26,6 +26,46 @@ def _text_upload_filename(text: str) -> str:
     return create_text_data(text).get_metadata()["name"]
 
 
+def _local_file_to_upload(item: str) -> Path | None:
+    """The existing local file ``item`` names, or None when ``item`` is text.
+
+    Local add() reads a string that names an existing file as that file
+    (``resolve_data_directories``). A remote instance cannot read the caller's
+    disk, so the file's bytes have to travel in the upload; sending the string
+    would make the path text itself the document. Paths outside
+    ``COGNEE_ALLOWED_LOCAL_FILE_ROOTS`` stay text, as they do locally.
+    """
+    from cognee.infrastructure.files.utils.local_path_safety import resolve_local_path
+
+    try:
+        path = resolve_local_path(item, must_exist=True)
+    except (OSError, ValueError):
+        return None
+    if path.is_dir():
+        raise ValueError(
+            f"{item!r} is a directory; over serve(), pass the paths of the files in it."
+        )
+    return path if path.is_file() else None
+
+
+def _add_data_field(form: aiohttp.FormData, item: Any) -> None:
+    """Add one add()/remember() item to the multipart ``data`` field."""
+    if isinstance(item, str):
+        local_file = _local_file_to_upload(item)
+        if local_file is not None:
+            form.add_field("data", local_file.open("rb"), filename=local_file.name)
+        else:
+            form.add_field(
+                "data",
+                io.BytesIO(item.encode("utf-8")),
+                filename=_text_upload_filename(item),
+                content_type="text/plain",
+            )
+    elif hasattr(item, "read"):
+        name = getattr(item, "name", "upload")
+        form.add_field("data", item, filename=name)
+
+
 def _failed_update_result(body: str) -> dict | None:
     """Parse a 500 body as an update result when it is one with status "failed"."""
     from cognee.api.v1.update.result import UpdateResult
@@ -169,29 +209,12 @@ class CloudClient:
                 # the SKILL.md layout when writing to its tempdir.
                 rel = skill_path.relative_to(base).as_posix()
                 form.add_field("data", skill_path.open("rb"), filename=rel)
-        # Handle data — string or file-like objects
-        elif isinstance(data, str):
-            form.add_field(
-                "data",
-                io.BytesIO(data.encode("utf-8")),
-                filename=_text_upload_filename(data),
-                content_type="text/plain",
-            )
+        # Handle data — text, local file paths or file-like objects
         elif isinstance(data, list):
             for item in data:
-                if isinstance(item, str):
-                    form.add_field(
-                        "data",
-                        io.BytesIO(item.encode("utf-8")),
-                        filename=_text_upload_filename(item),
-                        content_type="text/plain",
-                    )
-                elif hasattr(item, "read"):
-                    name = getattr(item, "name", "upload")
-                    form.add_field("data", item, filename=name)
-        elif hasattr(data, "read"):
-            name = getattr(data, "name", "upload")
-            form.add_field("data", data, filename=name)
+                _add_data_field(form, item)
+        else:
+            _add_data_field(form, data)
 
         # Code ingestion can block on a clone + whole-repo parse; the archive
         # timeout (no total cap) fits both. Prefer run_in_background=True for
@@ -354,28 +377,11 @@ class CloudClient:
         form = aiohttp.FormData()
         form.add_field("datasetName", dataset_name)
 
-        if isinstance(data, str):
-            form.add_field(
-                "data",
-                io.BytesIO(data.encode("utf-8")),
-                filename=_text_upload_filename(data),
-                content_type="text/plain",
-            )
-        elif isinstance(data, list):
+        if isinstance(data, list):
             for item in data:
-                if isinstance(item, str):
-                    form.add_field(
-                        "data",
-                        io.BytesIO(item.encode("utf-8")),
-                        filename=_text_upload_filename(item),
-                        content_type="text/plain",
-                    )
-                elif hasattr(item, "read"):
-                    name = getattr(item, "name", "upload")
-                    form.add_field("data", item, filename=name)
-        elif hasattr(data, "read"):
-            name = getattr(data, "name", "upload")
-            form.add_field("data", data, filename=name)
+                _add_data_field(form, item)
+        else:
+            _add_data_field(form, data)
 
         async with session.post(f"{self.service_url}/api/v1/add", data=form) as resp:
             if resp.status >= 400:
